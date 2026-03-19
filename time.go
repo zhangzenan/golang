@@ -80,7 +80,12 @@ func main() {
 	}
 
 	//sleep方式实现定时器
+	i = 5
 	for {
+		i--
+		if i == 0 {
+			break
+		}
 		time.Sleep(time.Second)
 		fmt.Println("我在定时执行任务")
 	}

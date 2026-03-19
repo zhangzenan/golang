@@ -20,7 +20,7 @@ func main() {
 	//<-ch2
 
 	//3、管道声明为只读
-	ch3 := make(<-chan int, 2)
+	//ch3 := make(<-chan int, 2)
 	//ch3 <- 23
 
 }
