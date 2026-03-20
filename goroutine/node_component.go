@@ -3,9 +3,53 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 	"time"
 )
+
+// 👉 全局错误监控器
+type PanicMonitor struct {
+	mu      sync.Mutex
+	panicCh chan interface{}
+	done    chan struct{}
+}
+
+var GlobalPanicMonitor = &PanicMonitor{
+	panicCh: make(chan interface{}, 10),
+	done:    make(chan struct{}),
+}
+
+// 启动全局监控
+func (pm *PanicMonitor) Start() {
+	go func() {
+		for {
+			select {
+			case p := <-pm.panicCh:
+				log.Printf("💥 全局捕获 panic: %v", p)
+			case <-pm.done:
+				return
+			}
+		}
+	}()
+}
+
+// 停止监控
+func (pm *PanicMonitor) Stop() {
+	close(pm.done)
+}
+
+// 注册 panic
+func (pm *PanicMonitor) Report(panicVal interface{}) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	select {
+	case pm.panicCh <- panicVal:
+	default:
+		log.Printf("⚠️ Panic channel full, dropped: %v", panicVal)
+	}
+}
 
 type NodeComponent struct {
 	name  string
@@ -18,34 +62,9 @@ func (d *NodeComponent) Name() string {
 
 func (c *NodeComponent) Execute(ctx context.Context, input []int) ([]int, error) {
 	fmt.Println("NodeComponent:", c.name)
-	// 👉 使用 goroutine 包装不可中断的操作
-	resultCh := make(chan struct {
-		data []int
-		err  error
-	}, 1)
-	go func() {
-		// 👉 添加 recover 保护
-		defer func() {
-			if r := recover(); r != nil {
-				resultCh <- struct {
-					data []int
-					err  error
-				}{nil, fmt.Errorf("panic recovered: %v", r)}
-			}
-		}()
-		data, err := c.doProcess(input)
-		resultCh <- struct {
-			data []int
-			err  error
-		}{data, err}
-	}()
-	select {
-	case <-ctx.Done():
-		fmt.Println(c.name, "超时/取消")
-		return nil, ctx.Err()
-	case result := <-resultCh:
-		return result.data, result.err
-	}
+
+	data, err := c.doProcess(input)
+	return data, err
 }
 
 // 👇 新增：纯业务逻辑方法
@@ -55,10 +74,10 @@ func (c *NodeComponent) doProcess(input []int) ([]int, error) {
 		result = append(result, v*2)
 	}
 	if c.Name() == "D" {
-		//time.Sleep(time.Second * 1)
-		a := 0
+		time.Sleep(time.Second * 3)
+		/*a := 0
 		b := 5 / a
-		fmt.Println(b)
+		fmt.Println(b)*/
 	}
 	fmt.Println(c.name, "执行完成")
 	return result, nil
@@ -85,17 +104,40 @@ func RunComponents(parentCtx context.Context, components []NodeComponent, input 
 			ctx, cancel := context.WithTimeout(parentCtx, timeout)
 			defer cancel()
 
-			data, err := c.Execute(ctx, input)
+			doneCh := make(chan struct {
+				data []int
+				err  error
+			}, 1)
 
+			go func() {
+				data, err := c.Execute(ctx, input)
+				doneCh <- struct {
+					data []int
+					err  error
+				}{data, err}
+			}()
+
+			var res Result
 			// 👉 不阻塞写入（防止泄漏）
 			select {
-			case resultCh <- Result{
-				Name: c.Name(),
-				Data: data,
-				Err:  err,
-			}:
+			case <-ctx.Done():
+				fmt.Println(c.Name(), "超时/取消")
+				res = Result{
+					Name: c.Name(),
+					Data: nil,
+					Err:  ctx.Err(),
+				}
+			case result := <-doneCh:
+				res = Result{
+					Name: c.Name(),
+					Data: result.data,
+					Err:  result.err,
+				}
+			}
+			// 👉 统一发送，只需一次 select
+			select {
+			case resultCh <- res:
 			case <-parentCtx.Done():
-				return
 			}
 
 		}(cmp)
@@ -116,6 +158,16 @@ func RunComponents(parentCtx context.Context, components []NodeComponent, input 
 }
 
 func main() {
+	// 👉 启动全局 panic 监控
+	GlobalPanicMonitor.Start()
+	defer GlobalPanicMonitor.Stop()
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("💥 Main函数最终防线：%v", r)
+			os.Exit(1) // 如果 main 崩溃，退出程序
+		}
+	}()
 	components := []NodeComponent{
 		{name: "A", delay: 2 * time.Second},
 		{name: "B", delay: 4 * time.Second},
